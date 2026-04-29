@@ -14,6 +14,10 @@ from zarr import Group
 from zarr.core.buffer import default_buffer_prototype
 from zarr.core.sync import SyncMixin
 
+import concurrent.futures as futures
+
+import time
+
 from .plate import get_first_field_path, get_first_well, get_pyramid_lazy
 
 # StrDict = Dict[str, Any]
@@ -480,6 +484,261 @@ class Scene(Spec):
         #     yield from child.iter_nodes()
 
 
+class FusedScene(Spec):
+    """
+    A replacement for Scene that fuses all multiscale images into a single 
+    Dask virtual canvas per zoom level, returning only ONE layer to Napari.
+    """
+    @staticmethod
+    def matches(group: zarr.Group) -> bool:
+        attrs = Spec.get_attrs(group)
+        return "scene" in attrs
+
+    def __init__(self, group: zarr.Group):
+        super().__init__(group)
+        self.fused_pyramid: List[da.core.Array] = []
+        self.fused_metadata: Dict[str, Any] = {}
+        self._build_fused_scene()
+
+    def _build_fused_scene(self):
+        """Pre-computes the bounding box and constructs the lazy Dask canvas."""
+        scene_attrs = Spec.get_attrs(self.group).get("scene", {})
+        transfs = scene_attrs.get("coordinateTransformations", [])
+
+        images_info = []
+        base_metadata = None
+
+        parse_start = time.perf_counter()
+
+        def parse_tile(transf):
+            image_path = transf.get("input", {}).get("path", None)
+            if not image_path:
+                return None
+            
+            try:
+                # Heavy I/O is safely handled by the threads
+                g = self.group[image_path]
+                if Multiscales.matches(g):
+                    ms_image = Multiscales(g)
+                    pyramid = ms_image.data()
+                    pyramid.sort(key=lambda arr: np.prod(arr.shape), reverse=True)
+                    
+                    return {
+                        "path": image_path,
+                        "pyramid": pyramid,
+                        "raw_transf": transf, # --- FIX: Pass the raw dictionary out ---
+                        "ms_image": ms_image
+                    }
+            except Exception as e:
+                print(f"Error reading {image_path}: {e}")
+            return None
+
+        # Execute the I/O concurrently
+        with futures.ThreadPoolExecutor(max_workers=1000) as executor:
+            results = list(executor.map(parse_tile, transfs))
+
+        # Process the results safely in the main thread
+        for res in results:
+            if res is not None:
+                if base_metadata is None:
+                    base_metadata = res["ms_image"].metadata()
+                
+                # --- FIX: Safely instantiate Napari Affine objects synchronously ---
+                aff = transform_to_affine(res["raw_transf"])
+                res["transform"] = aff.affine_matrix if aff else np.eye(3)
+                
+                # Clean up memory
+                res.pop("ms_image", None)
+                res.pop("raw_transf", None)
+                images_info.append(res)
+
+        if not images_info:
+            return
+
+        self.fused_metadata = base_metadata.copy()
+        self.fused_metadata["name"] = f"Fused Scene ({len(images_info)} tiles)"
+        
+        self.fused_metadata.pop("affine", None)
+        self.fused_metadata.pop("scale", None)
+
+        parse_end = time.perf_counter()
+        print(f"Parsed {len(images_info)} tiles in {(parse_end - parse_start) * 1000:.3f} ms")
+        info_start = time.perf_counter()
+        num_levels = min(len(info["pyramid"]) for info in images_info)
+
+        l0_min_y, l0_min_x = float('inf'), float('inf')
+        l0_max_y, l0_max_x = float('-inf'), float('-inf')
+
+        for info in images_info:
+            h, w = info["pyramid"][0].shape[-2:]
+            y_offset = info["transform"][-3, -1]
+            x_offset = info["transform"][-2, -1]
+            
+            l0_min_y = min(l0_min_y, y_offset)
+            l0_min_x = min(l0_min_x, x_offset)
+            l0_max_y = max(l0_max_y, y_offset + h)
+            l0_max_x = max(l0_max_x, x_offset + w)
+
+        max_scale_factor = 2 ** (num_levels - 1)
+        aligned_min_y = int(np.floor(l0_min_y / max_scale_factor) * max_scale_factor)
+        aligned_min_x = int(np.floor(l0_min_x / max_scale_factor) * max_scale_factor)
+        aligned_max_y = int(np.ceil(l0_max_y / max_scale_factor) * max_scale_factor)
+        aligned_max_x = int(np.ceil(l0_max_x / max_scale_factor) * max_scale_factor)
+
+        l0_spatial_shape = (aligned_max_y - aligned_min_y, aligned_max_x - aligned_min_x)
+        self.fused_metadata["translate"] = (aligned_min_y, aligned_min_x)
+
+        for level in range(num_levels):
+            template_tile = images_info[0]["pyramid"][level]
+            prefix_shape = template_tile.shape[:-2]
+            
+            # --- FIX 3: Dynamic Native Ratios instead of hardcoded 2**level ---
+            # This perfectly syncs the canvas shape with the actual Zarr tile reduction
+            ratio_y = images_info[0]["pyramid"][0].shape[-2] / template_tile.shape[-2]
+            ratio_x = images_info[0]["pyramid"][0].shape[-1] / template_tile.shape[-1]
+            
+            spatial_shape = (
+                int(np.round(l0_spatial_shape[0] / ratio_y)),
+                int(np.round(l0_spatial_shape[1] / ratio_x))
+            )
+            canvas_shape = prefix_shape + spatial_shape
+            level_tiles = []
+            for info in images_info:
+                y_offset = int(np.round(info["transform"][-3, -1] / ratio_y))
+                x_offset = int(np.round(info["transform"][-2, -1] / ratio_x))
+                tile = info["pyramid"][level]
+                t_h, t_w = tile.shape[-2:]
+                
+                # Store only the fast primitive integers we need for the intersection math
+                level_tiles.append((y_offset, x_offset, t_h, t_w, tile))
+
+            # --- NEW: Define a much larger chunk size for the Napari renderer ---
+            # 1024 or 2048 are usually the sweet spots for GPU texture uploads
+            target_spatial_chunk = (1024, 1024) 
+            
+            # Ensure the prefix dimensions (like channels or Z) are chunked as 1
+            prefix_chunks = tuple(1 for _ in prefix_shape)
+            custom_chunks = prefix_chunks + target_spatial_chunk
+            
+            # Create the canvas using the custom larger chunks
+            canvas_template = da.zeros(canvas_shape, chunks=custom_chunks, dtype=template_tile.dtype)
+            #canvas_template = da.zeros(canvas_shape, chunks=template_tile.chunksize, dtype=template_tile.dtype)
+            
+
+            def render_chunk(
+                block, 
+                block_info=None, 
+                _level_tiles=level_tiles, 
+                _ratio_y=ratio_y, 
+                _ratio_x=ratio_x, 
+                _aligned_min_y=aligned_min_y, 
+                _aligned_min_x=aligned_min_x
+            ):
+                if block_info is None or len(block_info) == 0:
+                    return block
+
+                # timer start
+                start = time.perf_counter()
+                
+                loc = block_info[None]['array-location']
+                y_start = loc[-2][0]
+                x_start = loc[-1][0]
+                
+                scale_factor = 2 ** level
+                global_y_start = y_start + int(np.round(_aligned_min_y // scale_factor))
+                global_x_start = x_start + int(np.round(_aligned_min_x // scale_factor))
+                
+                chunk_data = np.zeros(block.shape, dtype=block.dtype)
+                block_h, block_w = block.shape[-2:]
+
+                fetch_tasks = []
+                write_coords = []
+
+                find_start = time.perf_counter()
+                # 1. Iterate through tiles and collect the delayed Dask slices
+                for y_offset, x_offset, t_h, t_w, tile in _level_tiles:
+                    inter_y_start = max(global_y_start, y_offset)
+                    inter_y_end = min(global_y_start + block_h, y_offset + t_h)
+                    
+                    # --- OPTIMIZATION 2: Fast-fail the Y-axis before calculating X ---
+                    if inter_y_start >= inter_y_end:
+                        continue 
+                        
+                    inter_x_start = max(global_x_start, x_offset)
+                    inter_x_end = min(global_x_start + block_w, x_offset + t_w)
+                    
+                    # --- OPTIMIZATION 3: Fast-fail the X-axis ---
+                    if inter_x_start >= inter_x_end:
+                        continue
+                        
+                    out_y_start = inter_y_start - global_y_start
+                    out_y_end = inter_y_end - global_y_start
+                    out_x_start = inter_x_start - global_x_start
+                    out_x_end = inter_x_end - global_x_start
+                    
+                    in_y_start = inter_y_start - y_offset
+                    in_y_end = inter_y_end - y_offset
+                    in_x_start = inter_x_start - x_offset
+                    in_x_end = inter_x_end - x_offset
+                    
+                    # SLICE, BUT DO NOT COMPUTE YET
+                    # This creates a delayed Dask object
+                    delayed_slice = tile[..., in_y_start:in_y_end, in_x_start:in_x_end]
+                    
+                    # Store the delayed task and its corresponding target coordinates
+                    fetch_tasks.append(delayed_slice)
+                    write_coords.append((out_y_start, out_y_end, out_x_start, out_x_end))
+
+
+                find_end = time.perf_counter()
+                print(f"Found {len(fetch_tasks)} overlapping tiles in {(find_end - find_start) * 1000:.3f} ms")
+                
+                # 2. Fetch all overlapping data in parallel
+                if fetch_tasks:
+                    fetch_start = time.perf_counter()
+                    
+                    # dask.compute resolves multiple delayed objects concurrently using its thread pool
+                    fetched_data = da.compute(*fetch_tasks) 
+                    
+                    fetch_end = time.perf_counter()
+                    print(f"Fetched {len(fetch_tasks)} tiles in parallel in {(fetch_end - fetch_start) * 1000:.3f} ms")
+
+                    # 3. Apply the fetched data to the chunk synchronously to avoid race conditions
+                    slice_start = time.perf_counter()
+                    
+                    for data_slice, (oy_s, oy_e, ox_s, ox_e) in zip(fetched_data, write_coords):
+                        chunk_data[..., oy_s:oy_e, ox_s:ox_e] = np.maximum(
+                            chunk_data[..., oy_s:oy_e, ox_s:ox_e],
+                            data_slice
+                        )
+                        
+                    slice_end = time.perf_counter()
+                    print(f"Applied {len(fetch_tasks)} tiles to chunk in {(slice_end - slice_start) * 1000:.3f} ms")
+
+                # time.sleep(1) #check if renders are happening in parralel
+                print(f"lenght level tiles: {len(_level_tiles)}")
+                #print(f"Fetched {fetched_tiles} tiles for chunk at {loc}")
+                # timer end
+                end = time.perf_counter()
+                print(f"Rendered chunk at {loc} in {end - start:.6f} seconds")
+
+                return chunk_data
+
+            fused_level = canvas_template.map_blocks(render_chunk, dtype=canvas_template.dtype)
+            self.fused_pyramid.append(fused_level)
+        info_end = time.perf_counter()
+        print(f"Constructed fused canvas pyramid in {(info_end - info_start) * 1000:.3f} ms")
+
+    def data(self) -> list[da.core.Array]:
+        return self.fused_pyramid
+
+    def metadata(self) -> Dict[str, Any]:
+        return self.fused_metadata
+
+    # Override iter_nodes to ONLY yield self, completely bypassing the recursive layer generation
+    def iter_nodes(self) -> Iterable["Spec"]:
+        yield self
+
 class Plate(Spec):
     @staticmethod
     def matches(group: Group) -> bool:
@@ -671,7 +930,7 @@ def read_ome_zarr(root_group: Group) -> Callable:
             spec = Plate(root_group)
         elif Scene.matches(root_group):
             print("Scene")
-            spec = Scene(root_group)
+            spec = FusedScene(root_group)
         else:
             print("No matching spec", root_group)
 
