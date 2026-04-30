@@ -534,16 +534,38 @@ class FusedScene(Spec):
             return None
 
         # Execute the I/O concurrently
-        with futures.ThreadPoolExecutor(max_workers=1000) as executor:
-            results = list(executor.map(parse_tile, transfs))
+        # with futures.ThreadPoolExecutor(max_workers=1000) as executor:
+        #     results = list(executor.map(parse_tile, transfs))
+        results = []
+        for transf in transfs:
+            res = parse_tile(transf)
+            if res is not None:
+                results.append(res)
+            
 
         # Process the results safely in the main thread
         for res in results:
             if res is not None:
+                ms_image = res["ms_image"]
                 if base_metadata is None:
-                    base_metadata = res["ms_image"].metadata()
-                
-                # --- FIX: Safely instantiate Napari Affine objects synchronously ---
+                    base_metadata = ms_image.metadata()
+
+                l0_scale = [1.0, 1.0, 1.0] # Fallback default
+                try:
+                    # Get the raw attributes of the multiscale group
+                    ms_attrs = Spec.get_attrs(ms_image.group)
+                    datasets = ms_attrs.get("multiscales", [{}])[0].get("datasets", [])
+                    
+                    # Look at datasets[0] (Level 0) for coordinateTransformations
+                    for ct in datasets[0].get("coordinateTransformations", []):
+                        if ct.get("type") == "scale":
+                            l0_scale = ct["scale"]
+                            break
+                except Exception as e:
+                    print(f"Warning: Could not parse scale for {res['path']}: {e}")
+
+                res["l0_scale"] = l0_scale # Store it for later!
+
                 aff = transform_to_affine(res["raw_transf"])
                 res["transform"] = aff.affine_matrix if aff else np.eye(3)
                 
@@ -573,6 +595,12 @@ class FusedScene(Spec):
             h, w = info["pyramid"][0].shape[-2:]
             y_offset = info["transform"][-3, -1]
             x_offset = info["transform"][-2, -1]
+
+            scale_y = info["l0_scale"][-2]
+            scale_x = info["l0_scale"][-1]
+
+            y_offset = y_offset / scale_y
+            x_offset = x_offset / scale_x
             
             l0_min_y = min(l0_min_y, y_offset)
             l0_min_x = min(l0_min_x, x_offset)
@@ -604,8 +632,19 @@ class FusedScene(Spec):
             canvas_shape = prefix_shape + spatial_shape
             level_tiles = []
             for info in images_info:
-                y_offset = int(np.round(info["transform"][-3, -1] / ratio_y))
-                x_offset = int(np.round(info["transform"][-2, -1] / ratio_x))
+                # y_offset = int(np.round(info["transform"][-3, -1] / ratio_y))
+                # x_offset = int(np.round(info["transform"][-2, -1] / ratio_x))
+                trans_y = info["transform"][-3, -1]
+                trans_x = info["transform"][-2, -1]
+                
+                scale_y = info["l0_scale"][-2]
+                scale_x = info["l0_scale"][-1]
+                
+                l0_y_offset = trans_y / scale_y
+                l0_x_offset = trans_x / scale_x
+                
+                y_offset = int(np.round(l0_y_offset / ratio_y))
+                x_offset = int(np.round(l0_x_offset / ratio_x))
                 tile = info["pyramid"][level]
                 t_h, t_w = tile.shape[-2:]
                 
@@ -616,8 +655,7 @@ class FusedScene(Spec):
             # 1024 or 2048 are usually the sweet spots for GPU texture uploads
             target_spatial_chunk = (1024, 1024) 
             
-            # Ensure the prefix dimensions (like channels or Z) are chunked as 1
-            prefix_chunks = tuple(1 for _ in prefix_shape)
+            prefix_chunks = prefix_shape
             custom_chunks = prefix_chunks + target_spatial_chunk
             
             # Create the canvas using the custom larger chunks
@@ -643,6 +681,7 @@ class FusedScene(Spec):
                 loc = block_info[None]['array-location']
                 y_start = loc[-2][0]
                 x_start = loc[-1][0]
+
                 
                 scale_factor = 2 ** level
                 global_y_start = y_start + int(np.round(_aligned_min_y // scale_factor))
@@ -684,7 +723,7 @@ class FusedScene(Spec):
                     # SLICE, BUT DO NOT COMPUTE YET
                     # This creates a delayed Dask object
                     delayed_slice = tile[..., in_y_start:in_y_end, in_x_start:in_x_end]
-                    
+
                     # Store the delayed task and its corresponding target coordinates
                     fetch_tasks.append(delayed_slice)
                     write_coords.append((out_y_start, out_y_end, out_x_start, out_x_end))
@@ -705,18 +744,18 @@ class FusedScene(Spec):
 
                     # 3. Apply the fetched data to the chunk synchronously to avoid race conditions
                     slice_start = time.perf_counter()
+
                     
                     for data_slice, (oy_s, oy_e, ox_s, ox_e) in zip(fetched_data, write_coords):
                         chunk_data[..., oy_s:oy_e, ox_s:ox_e] = np.maximum(
                             chunk_data[..., oy_s:oy_e, ox_s:ox_e],
                             data_slice
                         )
-                        
+
                     slice_end = time.perf_counter()
                     print(f"Applied {len(fetch_tasks)} tiles to chunk in {(slice_end - slice_start) * 1000:.3f} ms")
 
                 # time.sleep(1) #check if renders are happening in parralel
-                print(f"lenght level tiles: {len(_level_tiles)}")
                 #print(f"Fetched {fetched_tiles} tiles for chunk at {loc}")
                 # timer end
                 end = time.perf_counter()
