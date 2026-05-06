@@ -20,6 +20,22 @@ import time
 
 from .plate import get_first_field_path, get_first_well, get_pyramid_lazy
 
+import math
+from zarr.codecs.bytes import BytesCodec
+
+# Add a small patch to Zarr's BytesCodec to handle 4096-byte alignment padding in OME-Zarr chunk buffers.
+_orig_decode_sync = BytesCodec._decode_sync
+
+def _padded_decode_sync(self, chunk_bytes, chunk_spec):
+    expected_bytes = math.prod(chunk_spec.shape) * chunk_spec.dtype.item_size
+    
+    # If the buffer is larger due to alignment padding, truncate it
+    if len(chunk_bytes) > expected_bytes:
+        chunk_bytes = chunk_bytes[:expected_bytes]
+        
+    return _orig_decode_sync(self, chunk_bytes, chunk_spec)
+BytesCodec._decode_sync = _padded_decode_sync
+
 # StrDict = Dict[str, Any]
 # LayerData = Union[Tuple[Any], Tuple[Any, StrDict], Tuple[Any, StrDict, str]]
 LayerData = Tuple[List[da.core.Array], Dict[str, Any], str]
