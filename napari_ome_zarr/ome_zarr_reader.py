@@ -24,18 +24,30 @@ import math
 from zarr.codecs.bytes import BytesCodec
 
 # Add a small patch to Zarr's BytesCodec to handle 4096-byte alignment padding in OME-Zarr chunk buffers.
-_orig_decode_sync = BytesCodec._decode_sync
+# Dynamically patch based on the Zarr version installed
+if hasattr(BytesCodec, "_decode_sync"):
+    # Zarr v3.1.6+
+    _orig_decode_sync = BytesCodec._decode_sync
 
-def _padded_decode_sync(self, chunk_bytes, chunk_spec):
-    expected_bytes = math.prod(chunk_spec.shape) * chunk_spec.dtype.item_size
-    
-    # If the buffer is larger due to alignment padding, truncate it
-    if len(chunk_bytes) > expected_bytes:
-        chunk_bytes = chunk_bytes[:expected_bytes]
-        
-    return _orig_decode_sync(self, chunk_bytes, chunk_spec)
-BytesCodec._decode_sync = _padded_decode_sync
+    def _padded_decode_sync(self, chunk_bytes, chunk_spec):
+        expected_bytes = math.prod(chunk_spec.shape) * chunk_spec.dtype.item_size
+        if len(chunk_bytes) > expected_bytes:
+            chunk_bytes = chunk_bytes[:expected_bytes]
+        return _orig_decode_sync(self, chunk_bytes, chunk_spec)
 
+    BytesCodec._decode_sync = _padded_decode_sync
+
+elif hasattr(BytesCodec, "_decode_single"):
+    # Zarr v3.1.5
+    _orig_decode_single = BytesCodec._decode_single
+
+    async def _padded_decode_single(self, chunk_bytes, chunk_spec):
+        expected_bytes = math.prod(chunk_spec.shape) * chunk_spec.dtype.item_size
+        if len(chunk_bytes) > expected_bytes:
+            chunk_bytes = chunk_bytes[:expected_bytes]
+        return await _orig_decode_single(self, chunk_bytes, chunk_spec)
+
+    BytesCodec._decode_single = _padded_decode_single
 # StrDict = Dict[str, Any]
 # LayerData = Union[Tuple[Any], Tuple[Any, StrDict], Tuple[Any, StrDict, str]]
 LayerData = Tuple[List[da.core.Array], Dict[str, Any], str]
